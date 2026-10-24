@@ -52,3 +52,5 @@ Thấy dòng `Bot đang chạy` là xong. Tắt máy/tắt cửa sổ thì bot n
 
 - `@KienVG <câu hỏi>`: hỏi bất cứ gì
 - `@KienVG /reset`: xoá trí nhớ cuộc trò chuyện của nhóm
+- Đọc ảnh trong nhóm: gửi ảnh **kèm chú thích có tag bot** (vd `@Bot KienVG đọc ảnh này`). Ảnh gửi riêng không tag thì Zalo không chuyển cho bot.
+- Chat riêng với bot: gửi ảnh là bot tự đọc.
