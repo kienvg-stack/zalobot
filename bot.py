@@ -132,6 +132,7 @@ def send_sticker(chat_id: str, sticker: str | None):
         return
     try:
         zalo("sendSticker", chat_id=chat_id, sticker=sticker)
+        print(f"[gửi sticker] {chat_id}: {sticker}", flush=True)
     except Exception as e:
         print(f"[sticker lỗi] {e}", flush=True)
 
@@ -144,8 +145,11 @@ VOICE_DIR.mkdir(exist_ok=True)
 
 def start_voice_server():
     # Web server nhỏ phục vụ file .aac cho Zalo tải về (chỉ cần khi có PUBLIC_URL)
-    handler = functools.partial(SimpleHTTPRequestHandler, directory=str(VOICE_DIR))
-    handler.log_message = lambda *a: None
+    class QuietHandler(SimpleHTTPRequestHandler):
+        def log_message(self, *args):
+            pass
+
+    handler = functools.partial(QuietHandler, directory=str(VOICE_DIR))
     server = ThreadingHTTPServer(("0.0.0.0", PORT), handler)
     threading.Thread(target=server.serve_forever, daemon=True).start()
     print(f"Voice server: cổng {PORT} -> {PUBLIC_URL}", flush=True)
@@ -218,8 +222,10 @@ def clean_answer(answer: str, sender: str) -> str:
     return re.sub(r"\[([^\[\]\n]{1,60})\](?!\()", r"\1", answer).strip()
 
 
-VOICE_STYLE = ("(Câu trả lời này sẽ được đọc thành giọng nói: viết như đang nói chuyện, tự nhiên, "
-               "không markdown, không emoji, không gạch đầu dòng, tối đa khoảng 80 từ.)")
+VOICE_STYLE = ("(Hệ thống sẽ TỰ ĐỘNG đọc câu trả lời của bạn thành tin nhắn thoại gửi cho người dùng, "
+               "nên bạn hoàn toàn trả lời bằng giọng nói được: đừng nói mình không đọc/nói được, cứ trả lời thẳng "
+               "nội dung được yêu cầu (vd được bảo kể chuyện cười thì kể luôn). Viết như đang nói chuyện, tự nhiên, "
+               "không markdown, không emoji, không gạch đầu dòng, không thẻ sticker, tối đa khoảng 80 từ.)")
 
 
 def ask_gemini(chat_id: str, sender: str, text: str, image_url: str | None = None,
@@ -415,6 +421,7 @@ def handle_update(update: dict):
         elif use_voice:
             try:
                 zalo("sendVoice", chat_id=chat_id, voice_url=text_to_voice_url(answer))
+                print(f"[gửi voice] {chat_id}", flush=True)
             except Exception as e:
                 print(f"[voice lỗi] {e!r}", flush=True)
                 send_text(chat_id, answer)  # không tạo/gửi được voice thì trả lời bằng chữ
