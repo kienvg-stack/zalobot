@@ -1,15 +1,23 @@
 """Zalo bot trả lời trong nhóm chat bằng Gemini (key free từ Google AI Studio).
 
 Chạy: python bot.py  (đọc cấu hình từ file .env)
-Dùng long-polling (getUpdates) nên không cần server/public URL.
+Nhận tin bằng long-polling (getUpdates). Riêng trả lời bằng giọng nói cần PUBLIC_URL:
+bot tự mở web server nhỏ (cổng PORT) để Zalo tải file .aac về.
 """
 
+import functools
 import os
+import random
 import re
+import subprocess
+import tempfile
 import threading
 import time
+import uuid
 from collections import defaultdict, deque
 from datetime import datetime, timedelta, timezone
+from http.server import SimpleHTTPRequestHandler, ThreadingHTTPServer
+from pathlib import Path
 
 import requests
 from dotenv import load_dotenv
@@ -22,12 +30,17 @@ ZALO_TOKEN = os.environ["ZALO_BOT_TOKEN"]
 ZALO_API = f"https://bot-api.zaloplatforms.com/bot{ZALO_TOKEN}"
 MODEL = os.getenv("GEMINI_MODEL", "gemini-3.5-flash-lite")
 BOT_NAME = os.getenv("BOT_NAME", "KienVG")
-HISTORY_TURNS = int(os.getenv("HISTORY_TURNS", "20"))
+HISTORY_TURNS = int(os.getenv("HISTORY_TURNS", "50"))
 ENABLE_WEB_SEARCH = os.getenv("ENABLE_WEB_SEARCH", "1") == "1"
+TTS_MODEL = os.getenv("TTS_MODEL", "gemini-3.8-flash-lite-tts")
+TTS_VOICE = os.getenv("TTS_VOICE", "Kore")
+PUBLIC_URL = os.getenv("PUBLIC_URL", "").rstrip("/")  # vd http://zalobot-1-2-3-4.traefik.me
+PORT = int(os.getenv("PORT", "8080"))
+STICKER_RATE = float(os.getenv("STICKER_RATE", "0.35"))  # xác suất gửi kèm sticker sau mỗi câu trả lời
 
 SYSTEM_PROMPT = f"""Bạn là {BOT_NAME}, một trợ lý AI trong nhóm chat Zalo.
-- Trả lời bằng ngôn ngữ người hỏi dùng (mặc định tiếng Việt), thân thiện, ngắn gọn, đi thẳng vào ý.
-- Tin nhắn người dùng có dạng "[Tên]: nội dung" để bạn biết ai đang nói trong nhóm. Câu trả lời của bạn KHÔNG được mở đầu bằng "[Tên]:".
+- Trả lời bằng ngôn ngữ người hỏi dùng (mặc định tiếng Việt), thân thiện, dễ thương, ngắn gọn, đi thẳng vào ý.
+- Tin nhắn người dùng có dạng "Tên nói: nội dung" để bạn biết ai đang nói. Gọi người hỏi bằng tên bình thường (vd "Ryan ơi"), không bao giờ đặt tên trong ngoặc vuông [ ], và không mở đầu câu trả lời bằng "Tên nói:".
 - Mỗi tin có kèm thời gian hiện tại (giờ Việt Nam); dùng nó khi được hỏi ngày giờ.
 - Zalo hiển thị markdown hạn chế: dùng **in đậm** và gạch đầu dòng đơn giản, tránh bảng và heading.
 - Câu hỏi cần thông tin mới (tin tức, giá cả, thời tiết...) thì dùng Google Search nếu có."""
@@ -81,6 +94,79 @@ def typing(chat_id: str):
         pass
 
 
+# ---------- Sticker ----------
+
+STICKER_FILE = Path(__file__).with_name("stickers.txt")
+stickers: list[str] = [
+    s.strip() for s in (STICKER_FILE.read_text(encoding="utf-8").splitlines() if STICKER_FILE.exists() else [])
+    if s.strip() and not s.startswith("#")
+]
+
+
+def maybe_send_sticker(chat_id: str):
+    if stickers and random.random() < STICKER_RATE:
+        try:
+            zalo("sendSticker", chat_id=chat_id, sticker=random.choice(stickers))
+        except Exception as e:
+            print(f"[sticker lỗi] {e}", flush=True)
+
+
+# ---------- Giọng nói ----------
+
+VOICE_DIR = Path(tempfile.gettempdir()) / "zalo-voice"
+VOICE_DIR.mkdir(exist_ok=True)
+
+
+def start_voice_server():
+    # Web server nhỏ phục vụ file .aac cho Zalo tải về (chỉ cần khi có PUBLIC_URL)
+    handler = functools.partial(SimpleHTTPRequestHandler, directory=str(VOICE_DIR))
+    handler.log_message = lambda *a: None
+    server = ThreadingHTTPServer(("0.0.0.0", PORT), handler)
+    threading.Thread(target=server.serve_forever, daemon=True).start()
+    print(f"Voice server: cổng {PORT} -> {PUBLIC_URL}", flush=True)
+
+
+def text_to_voice_url(text: str) -> str:
+    """Gemini TTS -> ffmpeg ra .aac -> trả về link công khai."""
+    for f in VOICE_DIR.glob("*.aac"):  # dọn file cũ hơn 1 giờ
+        if time.time() - f.stat().st_mtime > 3600:
+            f.unlink(missing_ok=True)
+
+    r = client.models.generate_content(
+        model=TTS_MODEL,
+        contents=text,
+        config=types.GenerateContentConfig(
+            response_modalities=["AUDIO"],
+            speech_config=types.SpeechConfig(
+                voice_config=types.VoiceConfig(prebuilt_voice_config=types.PrebuiltVoiceConfig(voice_name=TTS_VOICE))
+            ),
+        ),
+    )
+    audio = r.candidates[0].content.parts[0].inline_data
+    # Gemini trả về WAV hoặc PCM thô (audio/L16;rate=24000)
+    if "wav" in audio.mime_type:
+        src_args = ["-f", "wav"]
+    else:
+        rate = re.search(r"rate=(\d+)", audio.mime_type)
+        src_args = ["-f", "s16le", "-ar", rate.group(1) if rate else "24000", "-ac", "1"]
+    name = f"{uuid.uuid4().hex}.aac"
+    subprocess.run(
+        ["ffmpeg", "-loglevel", "error", "-y", *src_args, "-i", "pipe:0", "-c:a", "aac", "-b:a", "64k",
+         str(VOICE_DIR / name)],
+        input=audio.data, check=True,
+    )
+    return f"{PUBLIC_URL}/{name}"
+
+
+def download_audio(url: str) -> types.Part:
+    r = requests.get(url, timeout=30)
+    r.raise_for_status()
+    mime = r.headers.get("Content-Type", "audio/aac").split(";")[0]
+    if not mime.startswith("audio/"):
+        mime = "audio/aac"
+    return types.Part.from_bytes(data=r.content, mime_type=mime)
+
+
 # ---------- Gemini ----------
 
 def generate(contents, use_search: bool):
@@ -100,15 +186,30 @@ def download_image(url: str) -> types.Part:
     return types.Part.from_bytes(data=r.content, mime_type=mime)
 
 
-def ask_gemini(chat_id: str, sender: str, text: str, image_url: str | None = None) -> str:
+def clean_answer(answer: str, sender: str) -> str:
+    answer = answer.strip()
+    answer = re.sub(rf"^\[?{re.escape(sender)}\]?\s*(nói)?\s*:\s*", "", answer)  # "Tên nói:" ở đầu
+    # Bỏ ngoặc vuông quanh tên: "[Gia Kiện - Ryan] ơi" -> "Gia Kiện - Ryan ơi" (giữ link markdown [x](url))
+    return re.sub(r"\[([^\[\]\n]{1,60})\](?!\()", r"\1", answer).strip()
+
+
+VOICE_STYLE = ("(Câu trả lời này sẽ được đọc thành giọng nói: viết như đang nói chuyện, tự nhiên, "
+               "không markdown, không emoji, không gạch đầu dòng, tối đa khoảng 80 từ.)")
+
+
+def ask_gemini(chat_id: str, sender: str, text: str, image_url: str | None = None,
+               audio_url: str | None = None, for_voice: bool = False) -> str:
     history = histories[chat_id]
-    # Lịch sử chỉ lưu chữ (không lưu ảnh) cho gọn
-    note = " (kèm 1 ảnh)" if image_url else ""
-    user_turn = {"role": "user", "parts": [{"text": f"[{sender}]{note}: {text}"}]}
+    # Lịch sử chỉ lưu chữ (không lưu ảnh/âm thanh) cho gọn
+    note = " (kèm 1 ảnh)" if image_url else " (gửi tin nhắn thoại)" if audio_url else ""
+    user_turn = {"role": "user", "parts": [{"text": f"{sender}{note} nói: {text}"}]}
     now = datetime.now(VN_TZ)
     now_text = f"(Bây giờ là {WEEKDAYS[now.weekday()]}, {now:%d/%m/%Y %H:%M})"
     parts = [download_image(image_url)] if image_url else []
-    parts.append(types.Part.from_text(text=f"{now_text}\n[{sender}]: {text}"))
+    if audio_url:
+        parts.append(download_audio(audio_url))
+    extra = f"\n{VOICE_STYLE}" if for_voice else ""
+    parts.append(types.Part.from_text(text=f"{now_text}{extra}\n{sender} nói: {text}"))
     contents = list(history) + [types.Content(role="user", parts=parts)]
 
     try:
@@ -119,7 +220,7 @@ def ask_gemini(chat_id: str, sender: str, text: str, image_url: str | None = Non
         # Gói free có thể hết lượt Google Search -> thử lại không search
         response = generate(contents, False)
 
-    answer = re.sub(r"^\[[^\]\n]{1,60}\]:\s*", "", (response.text or "").strip())
+    answer = clean_answer(response.text or "", sender)
     if not answer:
         return "(Mình chưa có câu trả lời, bạn hỏi lại giúp mình nhé.)"
 
@@ -165,10 +266,29 @@ def post_to_group(user_id: str, sender: str, question: str, answer: str) -> str:
     return "Đã gửi câu trả lời vào nhóm ✅"
 
 
+VOICE_RE = re.compile(
+    r"voice|giọng nói|giong noi|bằng giọng|bang giong|tin nhắn thoại|ghi âm|(nói|đọc)( cho)?( tui| tôi| mình| em| anh)? nghe",
+    re.IGNORECASE,
+)
+VOICE_PROMPT = "Hãy nghe tin nhắn thoại đính kèm và trả lời."
+
+
+def handle_sticker(chat_id: str, is_group: bool, msg: dict):
+    code = msg.get("sticker")
+    if not code:
+        return
+    print(f"[sticker] {code} {msg.get('url', '')}", flush=True)
+    if code not in stickers:
+        stickers.append(code)  # học sticker mới ngay (mất khi restart; thêm vào stickers.txt để giữ lâu dài)
+    if not is_group:
+        zalo("sendSticker", chat_id=chat_id, sticker=random.choice(stickers))
+
+
 def handle_update(update: dict):
     print(f"[nhận] {update}", flush=True)
     event = update.get("event_name")
-    if event not in ("message.text.received", "message.image.received"):
+    if event not in ("message.text.received", "message.image.received",
+                     "message.sticker.received", "message.voice.received"):
         return
     msg = update.get("message") or {}
     chat = msg.get("chat") or {}
@@ -181,9 +301,18 @@ def handle_update(update: dict):
     if is_group and user_id:
         user_groups[user_id] = chat_id
 
-    image_url = None
+    if event == "message.sticker.received":
+        handle_sticker(chat_id, is_group, msg)
+        return
+
+    image_url = audio_url = None
     to_group = False
-    if event == "message.image.received":
+    if event == "message.voice.received":
+        audio_url = msg.get("voice_url")
+        if not audio_url:
+            return
+        text = VOICE_PROMPT
+    elif event == "message.image.received":
         image_url = msg.get("photo_url")
         raw = (msg.get("caption") or "").strip()
         if not image_url:
@@ -234,10 +363,15 @@ def handle_update(update: dict):
         text = rest or IMAGE_PROMPT
         to_group = True
 
+    # Trả lời bằng giọng nói khi người dùng gửi voice hoặc yêu cầu voice.
+    # Zalo chỉ cho bot gửi voice trong chat riêng, và cần PUBLIC_URL để Zalo tải file.
+    wants_voice = (audio_url is not None or bool(VOICE_RE.search(text))) and not to_group
+    use_voice = wants_voice and not is_group and bool(PUBLIC_URL)
+
     with chat_locks[chat_id]:  # mỗi nhóm trả lời lần lượt, các nhóm khác chạy song song
         typing(chat_id)
         try:
-            answer = ask_gemini(chat_id, sender, text, image_url)
+            answer = ask_gemini(chat_id, sender, text, image_url, audio_url, for_voice=use_voice)
         except errors.ClientError as e:
             print(f"[Gemini lỗi {e.code}] {e.message}")
             if e.code == 429:
@@ -252,8 +386,17 @@ def handle_update(update: dict):
             answer = "Có lỗi xảy ra, thử lại sau nhé."
         if to_group:
             send_text(chat_id, post_to_group(user_id, sender, text, answer))
+        elif use_voice:
+            try:
+                zalo("sendVoice", chat_id=chat_id, voice_url=text_to_voice_url(answer))
+            except Exception as e:
+                print(f"[voice lỗi] {e!r}", flush=True)
+                send_text(chat_id, answer)  # không tạo/gửi được voice thì trả lời bằng chữ
         else:
+            if wants_voice and is_group:
+                answer += "\n\n_(Zalo chỉ cho bot gửi tin nhắn thoại trong chat riêng nha)_"
             send_text(chat_id, answer)
+            maybe_send_sticker(chat_id)
             if not is_group and image_url:
                 last_private[user_id] = (text, answer)
                 send_text(chat_id, SEND_GROUP_PROMPT)
@@ -264,7 +407,9 @@ def handle_update(update: dict):
 
 def main():
     me = zalo("getMe")
-    print(f"Bot đang chạy: {me.get('result')}  | model={MODEL}")
+    print(f"Bot đang chạy: {me.get('result')}  | model={MODEL} | {len(stickers)} sticker", flush=True)
+    if PUBLIC_URL:
+        start_voice_server()
     try:
         zalo("deleteWebhook")  # getUpdates không chạy được khi đang có webhook
     except Exception:
