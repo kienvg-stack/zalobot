@@ -150,7 +150,10 @@ recent_images: dict[str, tuple[str, float]] = {}
 SEND_GROUP_RE = re.compile(r"g[ửu]i\s*nh[óo]m", re.IGNORECASE)
 DEFAULT_GROUP_ID = os.getenv("DEFAULT_GROUP_ID", "")
 user_groups: dict[str, str] = {}  # user_id -> nhóm gần nhất người đó tag bot
-last_private: dict[str, tuple[str, str]] = {}  # user_id -> (câu hỏi, câu trả lời) gần nhất trong chat riêng
+last_private: dict[str, tuple[str, str]] = {}  # user_id -> (câu hỏi, câu trả lời) về ảnh đang chờ "gửi nhóm"
+YES_WORDS = {"1", "có", "co", "ok", "gửi", "gui", "yes", "y"}
+NO_WORDS = {"2", "không", "khong", "ko", "k", "no", "thôi", "thoi"}
+SEND_GROUP_PROMPT = "👉 Gửi câu trả lời này vào nhóm?\n**1** - Gửi nhóm\n**2** - Không"
 
 
 def post_to_group(user_id: str, sender: str, question: str, answer: str) -> str:
@@ -209,6 +212,16 @@ def handle_update(update: dict):
         send_text(chat_id, "Đã xoá trí nhớ cuộc trò chuyện.")
         return
 
+    # Zalo Bot API không có nút bấm -> trả lời nhanh bằng 1 / 2 sau khi bot đọc ảnh
+    if not is_group and user_id in last_private:
+        choice = text.lower().strip(" .!")
+        if choice in YES_WORDS:
+            text = "gửi nhóm"
+        elif choice in NO_WORDS:
+            last_private.pop(user_id)
+            send_text(chat_id, "Ok, không gửi 👍")
+            return
+
     if not is_group and SEND_GROUP_RE.search(text):
         rest = SEND_GROUP_RE.sub("", text).strip(" .,:-")
         if not rest and not image_url:
@@ -241,10 +254,11 @@ def handle_update(update: dict):
             send_text(chat_id, post_to_group(user_id, sender, text, answer))
         else:
             send_text(chat_id, answer)
-            if not is_group:
+            if not is_group and image_url:
                 last_private[user_id] = (text, answer)
-                if image_url:
-                    send_text(chat_id, "(Nhắn \"gửi nhóm\" để đăng câu trả lời này vào nhóm)")
+                send_text(chat_id, SEND_GROUP_PROMPT)
+            elif not is_group:
+                last_private.pop(user_id, None)  # hỏi câu khác thì bỏ lời mời gửi nhóm cũ
         print(f"[đã trả lời] {chat_id}: {answer[:80]!r}", flush=True)
 
 
