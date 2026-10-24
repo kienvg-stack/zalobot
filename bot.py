@@ -363,9 +363,9 @@ def handle_update(update: dict):
         text = rest or IMAGE_PROMPT
         to_group = True
 
-    # Trả lời bằng giọng nói khi người dùng gửi voice hoặc yêu cầu voice.
+    # Chỉ trả lời bằng giọng nói khi người dùng yêu cầu ("voice", "nói cho tui nghe"...); bình thường trả lời chữ.
     # Zalo chỉ cho bot gửi voice trong chat riêng, và cần PUBLIC_URL để Zalo tải file.
-    wants_voice = (audio_url is not None or bool(VOICE_RE.search(text))) and not to_group
+    wants_voice = bool(VOICE_RE.search(text)) and not to_group
     use_voice = wants_voice and not is_group and bool(PUBLIC_URL)
 
     with chat_locks[chat_id]:  # mỗi nhóm trả lời lần lượt, các nhóm khác chạy song song
