@@ -91,12 +91,25 @@ def generate(contents, use_search: bool):
     return client.models.generate_content(model=MODEL, contents=contents, config=config)
 
 
-def ask_gemini(chat_id: str, sender: str, text: str) -> str:
+def download_image(url: str) -> types.Part:
+    r = requests.get(url, timeout=30)
+    r.raise_for_status()
+    mime = r.headers.get("Content-Type", "image/jpeg").split(";")[0]
+    if not mime.startswith("image/"):
+        mime = "image/jpeg"
+    return types.Part.from_bytes(data=r.content, mime_type=mime)
+
+
+def ask_gemini(chat_id: str, sender: str, text: str, image_url: str | None = None) -> str:
     history = histories[chat_id]
-    user_turn = {"role": "user", "parts": [{"text": f"[{sender}]: {text}"}]}
+    # Lịch sử chỉ lưu chữ (không lưu ảnh) cho gọn
+    note = " (kèm 1 ảnh)" if image_url else ""
+    user_turn = {"role": "user", "parts": [{"text": f"[{sender}]{note}: {text}"}]}
     now = datetime.now(VN_TZ)
     now_text = f"(Bây giờ là {WEEKDAYS[now.weekday()]}, {now:%d/%m/%Y %H:%M})"
-    contents = list(history) + [{"role": "user", "parts": [{"text": f"{now_text}\n[{sender}]: {text}"}]}]
+    parts = [download_image(image_url)] if image_url else []
+    parts.append(types.Part.from_text(text=f"{now_text}\n[{sender}]: {text}"))
+    contents = list(history) + [types.Content(role="user", parts=parts)]
 
     try:
         response = generate(contents, ENABLE_WEB_SEARCH)
@@ -120,28 +133,55 @@ def ask_gemini(chat_id: str, sender: str, text: str) -> str:
 MENTION_RE = re.compile(rf"@(?:Bot\s+)?{re.escape(BOT_NAME)}\b", re.IGNORECASE)
 
 
+IMAGE_PROMPT = "Đọc và giải thích nội dung ảnh này."
+IMAGE_TTL = 300  # ảnh gửi không kèm câu hỏi được giữ 5 phút chờ người tag bot hỏi tiếp
+
+# Ảnh gần nhất của mỗi chat: chat_id -> (photo_url, thời điểm nhận)
+recent_images: dict[str, tuple[str, float]] = {}
+
+
 def handle_update(update: dict):
     print(f"[nhận] {update}", flush=True)
-    if update.get("event_name") != "message.text.received":
+    event = update.get("event_name")
+    if event not in ("message.text.received", "message.image.received"):
         return
     msg = update.get("message") or {}
-    text = (msg.get("text") or "").strip()
-    chat_id = (msg.get("chat") or {}).get("id")
+    chat = msg.get("chat") or {}
+    chat_id = chat.get("id")
     sender = (msg.get("from") or {}).get("display_name", "Ai đó")
-    if not text or not chat_id or (msg.get("from") or {}).get("is_bot"):
+    if not chat_id or (msg.get("from") or {}).get("is_bot"):
         return
 
-    text = MENTION_RE.sub("", text).strip() or "Xin chào"
+    image_url = None
+    if event == "message.image.received":
+        image_url = msg.get("photo_url")
+        raw = (msg.get("caption") or "").strip()
+        if not image_url:
+            return
+        # Ảnh trong nhóm không tag bot: giữ lại, chờ người tag bot hỏi về nó
+        if chat.get("chat_type") == "GROUP" and not MENTION_RE.search(raw):
+            recent_images[chat_id] = (image_url, time.time())
+            return
+        text = MENTION_RE.sub("", raw).strip() or IMAGE_PROMPT
+    else:
+        raw = (msg.get("text") or "").strip()
+        if not raw:
+            return
+        text = MENTION_RE.sub("", raw).strip() or "Xin chào"
+        pending = recent_images.pop(chat_id, None)
+        if pending and time.time() - pending[1] < IMAGE_TTL:
+            image_url = pending[0]
 
     if text.lower() in ("/reset", "/clear"):
         histories.pop(chat_id, None)
+        recent_images.pop(chat_id, None)
         send_text(chat_id, "Đã xoá trí nhớ cuộc trò chuyện.")
         return
 
     with chat_locks[chat_id]:  # mỗi nhóm trả lời lần lượt, các nhóm khác chạy song song
         typing(chat_id)
         try:
-            answer = ask_gemini(chat_id, sender, text)
+            answer = ask_gemini(chat_id, sender, text, image_url)
         except errors.ClientError as e:
             print(f"[Gemini lỗi {e.code}] {e.message}")
             if e.code == 429:
