@@ -1,2 +1,0 @@
-# Mã sticker bot gửi kèm câu trả lời (mỗi dòng 1 mã).
-# Lấy mã: gửi sticker vào chat riêng với bot, log sẽ in dòng "[sticker] <mã> <link>".

@@ -9,7 +9,7 @@ ENV PYTHONUNBUFFERED=1 PYTHONIOENCODING=utf-8
 COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 
-COPY bot.py stickers.txt ./
+COPY bot.py ./
 
 EXPOSE 8080
 CMD ["python", "bot.py"]

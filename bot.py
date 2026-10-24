@@ -36,14 +36,17 @@ TTS_MODEL = os.getenv("TTS_MODEL", "gemini-3.8-flash-lite-tts")
 TTS_VOICE = os.getenv("TTS_VOICE", "Kore")
 PUBLIC_URL = os.getenv("PUBLIC_URL", "").rstrip("/")  # vd http://zalobot-1-2-3-4.traefik.me
 PORT = int(os.getenv("PORT", "8080"))
-STICKER_RATE = float(os.getenv("STICKER_RATE", "0.35"))  # xác suất gửi kèm sticker sau mỗi câu trả lời
+ENABLE_STICKERS = os.getenv("ENABLE_STICKERS", "1") == "1"  # gửi kèm sticker hợp ngữ cảnh
 
 SYSTEM_PROMPT = f"""Bạn là {BOT_NAME}, một trợ lý AI trong nhóm chat Zalo.
 - Trả lời bằng ngôn ngữ người hỏi dùng (mặc định tiếng Việt), thân thiện, dễ thương, ngắn gọn, đi thẳng vào ý.
 - Tin nhắn người dùng có dạng "Tên nói: nội dung" để bạn biết ai đang nói. Gọi người hỏi bằng tên bình thường (vd "Ryan ơi"), không bao giờ đặt tên trong ngoặc vuông [ ], và không mở đầu câu trả lời bằng "Tên nói:".
 - Mỗi tin có kèm thời gian hiện tại (giờ Việt Nam); dùng nó khi được hỏi ngày giờ.
 - Zalo hiển thị markdown hạn chế: dùng **in đậm** và gạch đầu dòng đơn giản, tránh bảng và heading.
-- Câu hỏi cần thông tin mới (tin tức, giá cả, thời tiết...) thì dùng Google Search nếu có."""
+- Câu hỏi cần thông tin mới (tin tức, giá cả, thời tiết...) thì dùng Google Search nếu có.
+- Khi hợp ngữ cảnh (chào hỏi, khen, an ủi, đùa vui, cảm ơn...), thêm ĐÚNG MỘT thẻ sticker ở cuối câu trả lời, dạng [[sticker:cảm_xúc]].
+  Cảm xúc chọn trong: vui, yeu, chill, buon, bat_ngo, xui, hoang, tu_tin, buc_minh, met, suy_nghi, tien, da.
+  Câu trả lời nghiêm túc, dài hoặc mang tính thông tin thuần thì không cần sticker."""
 
 VN_TZ = timezone(timedelta(hours=7))
 WEEKDAYS = ["Thứ Hai", "Thứ Ba", "Thứ Tư", "Thứ Năm", "Thứ Sáu", "Thứ Bảy", "Chủ Nhật"]
@@ -96,19 +99,41 @@ def typing(chat_id: str):
 
 # ---------- Sticker ----------
 
-STICKER_FILE = Path(__file__).with_name("stickers.txt")
-stickers: list[str] = [
-    s.strip() for s in (STICKER_FILE.read_text(encoding="utf-8").splitlines() if STICKER_FILE.exists() else [])
-    if s.strip() and not s.startswith("#")
-]
+# Bộ "Zapy Công Sở" (linh vật Zalo), mã lấy từ stickers.zaloapp.com/oa/detail?cid=743df4e6c8a321fd78b2
+# Gemini chọn cảm xúc hợp ngữ cảnh bằng thẻ [[sticker:<cảm xúc>]] ở cuối câu trả lời.
+STICKERS = {
+    "vui": ["a643836dbf2856760f39", "4fa37c8d40c8a996f0d9"],       # giơ ngón cái, phấn khích
+    "yeu": ["d063f44dc80821567819"],                               # ôm tim
+    "chill": ["7722510c6d498417dd58", "fd81daafe6ea0fb456fb"],     # uống trà sữa, thiền
+    "buon": ["7eb25e9c62d98b87d2c8", "0d1e3f300375ea2bb364"],      # khóc RIP, mếu
+    "bat_ngo": ["e136c018fc5d15034c4c", "98ffa4d1989471ca2885", "7b31461f7a5a9304ca4b"],  # Ủa, sét đánh, xịt keo
+    "xui": ["611743397f7c9622cf6d"],                               # xu cà na
+    "hoang": ["095c2a721637ff69a626", "8fdbb4f588b061ee38a1"],     # SOS, chạy đi
+    "tu_tin": ["34900abe36fbdfa586ea"],                            # sợ à?
+    "buc_minh": ["64985bb667f38eadd7e2", "c468fd46c103285d7112"],  # khó chịu, nổi điên
+    "met": ["c91bf135cd70242e7d61", "5d62694c5509bc57e518", "528a63a45fe1b6bfeff0"],  # drama, thức khuya, truyền nước
+    "suy_nghi": ["ae05942ba86e4130187f", "8430b11e8d5b64053d4a"],  # có learn, ngẫm
+    "tien": ["a4689246ae03475d1e12", "0fcd38e304a6edf8b4b7"],      # cơm áo gạo tiền, giàu
+    "da": ["d1b2e19cddd934876dc8"],                                # dạ (lễ phép, nhận lời)
+}
+ALL_STICKERS = [s for ids in STICKERS.values() for s in ids]
+STICKER_TAG_RE = re.compile(r"\[\[\s*sticker\s*:\s*([a-z_]+)\s*\]\]", re.IGNORECASE)
 
 
-def maybe_send_sticker(chat_id: str):
-    if stickers and random.random() < STICKER_RATE:
-        try:
-            zalo("sendSticker", chat_id=chat_id, sticker=random.choice(stickers))
-        except Exception as e:
-            print(f"[sticker lỗi] {e}", flush=True)
+def pop_sticker_tag(answer: str) -> tuple[str, str | None]:
+    """Tách thẻ [[sticker:...]] khỏi câu trả lời, trả về (câu trả lời, mã sticker hoặc None)."""
+    m = STICKER_TAG_RE.search(answer)
+    sticker = random.choice(STICKERS[m.group(1).lower()]) if m and m.group(1).lower() in STICKERS else None
+    return STICKER_TAG_RE.sub("", answer).strip(), sticker
+
+
+def send_sticker(chat_id: str, sticker: str | None):
+    if not (ENABLE_STICKERS and sticker):
+        return
+    try:
+        zalo("sendSticker", chat_id=chat_id, sticker=sticker)
+    except Exception as e:
+        print(f"[sticker lỗi] {e}", flush=True)
 
 
 # ---------- Giọng nói ----------
@@ -198,7 +223,8 @@ VOICE_STYLE = ("(Câu trả lời này sẽ được đọc thành giọng nói:
 
 
 def ask_gemini(chat_id: str, sender: str, text: str, image_url: str | None = None,
-               audio_url: str | None = None, for_voice: bool = False) -> str:
+               audio_url: str | None = None, for_voice: bool = False) -> tuple[str, str | None]:
+    """Trả về (câu trả lời, mã sticker hợp ngữ cảnh hoặc None)."""
     history = histories[chat_id]
     # Lịch sử chỉ lưu chữ (không lưu ảnh/âm thanh) cho gọn
     note = " (kèm 1 ảnh)" if image_url else " (gửi tin nhắn thoại)" if audio_url else ""
@@ -220,13 +246,14 @@ def ask_gemini(chat_id: str, sender: str, text: str, image_url: str | None = Non
         # Gói free có thể hết lượt Google Search -> thử lại không search
         response = generate(contents, False)
 
-    answer = clean_answer(response.text or "", sender)
+    body, sticker = pop_sticker_tag(response.text or "")
+    answer = clean_answer(body, sender)
     if not answer:
-        return "(Mình chưa có câu trả lời, bạn hỏi lại giúp mình nhé.)"
+        return "(Mình chưa có câu trả lời, bạn hỏi lại giúp mình nhé.)", None
 
     history.append(user_turn)
     history.append({"role": "model", "parts": [{"text": answer}]})
-    return answer
+    return answer, sticker
 
 
 # ---------- Xử lý tin nhắn ----------
@@ -278,10 +305,8 @@ def handle_sticker(chat_id: str, is_group: bool, msg: dict):
     if not code:
         return
     print(f"[sticker] {code} {msg.get('url', '')}", flush=True)
-    if code not in stickers:
-        stickers.append(code)  # học sticker mới ngay (mất khi restart; thêm vào stickers.txt để giữ lâu dài)
-    if not is_group:
-        zalo("sendSticker", chat_id=chat_id, sticker=random.choice(stickers))
+    if not is_group:  # gửi sticker cho bot thì bot "thả" lại 1 sticker vui
+        send_sticker(chat_id, random.choice(STICKERS["vui"] + STICKERS["yeu"]))
 
 
 def handle_update(update: dict):
@@ -370,8 +395,9 @@ def handle_update(update: dict):
 
     with chat_locks[chat_id]:  # mỗi nhóm trả lời lần lượt, các nhóm khác chạy song song
         typing(chat_id)
+        sticker = None
         try:
-            answer = ask_gemini(chat_id, sender, text, image_url, audio_url, for_voice=use_voice)
+            answer, sticker = ask_gemini(chat_id, sender, text, image_url, audio_url, for_voice=use_voice)
         except errors.ClientError as e:
             print(f"[Gemini lỗi {e.code}] {e.message}")
             if e.code == 429:
@@ -396,7 +422,7 @@ def handle_update(update: dict):
             if wants_voice and is_group:
                 answer += "\n\n_(Zalo chỉ cho bot gửi tin nhắn thoại trong chat riêng nha)_"
             send_text(chat_id, answer)
-            maybe_send_sticker(chat_id)
+            send_sticker(chat_id, sticker)
             if not is_group and image_url:
                 last_private[user_id] = (text, answer)
                 send_text(chat_id, SEND_GROUP_PROMPT)
@@ -407,7 +433,7 @@ def handle_update(update: dict):
 
 def main():
     me = zalo("getMe")
-    print(f"Bot đang chạy: {me.get('result')}  | model={MODEL} | {len(stickers)} sticker", flush=True)
+    print(f"Bot đang chạy: {me.get('result')}  | model={MODEL} | {len(ALL_STICKERS)} sticker", flush=True)
     if PUBLIC_URL:
         start_voice_server()
     try:
