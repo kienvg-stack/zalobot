@@ -136,6 +136,13 @@ MENTION_RE = re.compile(rf"@(?:Bot\s+)?{re.escape(BOT_NAME)}\b", re.IGNORECASE)
 IMAGE_PROMPT = "Đọc và giải thích nội dung ảnh này."
 IMAGE_TTL = 300  # ảnh gửi không kèm câu hỏi được giữ 5 phút chờ người tag bot hỏi tiếp
 
+ASKS_ABOUT_IMAGE_RE = re.compile(r"\b(ảnh|hình|hinh|anh)\b.{0,15}\b(trên|tren|này|nay|đó|do|vừa)\b", re.IGNORECASE)
+IMAGE_HOWTO = (
+    f"Trong nhóm mình chỉ thấy được tin có tag mình, nên chưa thấy ảnh đó 😅\n"
+    f"Bạn gửi lại ảnh và **ghi chú thích có tag @{BOT_NAME}** (vd: \"@{BOT_NAME} đọc ảnh này\"), "
+    f"hoặc gửi ảnh vào chat riêng với mình nhé."
+)
+
 # Ảnh gần nhất của mỗi chat: chat_id -> (photo_url, thời điểm nhận)
 recent_images: dict[str, tuple[str, float]] = {}
 
@@ -171,6 +178,10 @@ def handle_update(update: dict):
         pending = recent_images.pop(chat_id, None)
         if pending and time.time() - pending[1] < IMAGE_TTL:
             image_url = pending[0]
+        elif chat.get("chat_type") == "GROUP" and ASKS_ABOUT_IMAGE_RE.search(text):
+            # Zalo không chuyển ảnh không tag bot trong nhóm -> hướng dẫn cách gửi
+            send_text(chat_id, IMAGE_HOWTO)
+            return
 
     if text.lower() in ("/reset", "/clear"):
         histories.pop(chat_id, None)
