@@ -146,6 +146,21 @@ IMAGE_HOWTO = (
 # Ảnh gần nhất của mỗi chat: chat_id -> (photo_url, thời điểm nhận)
 recent_images: dict[str, tuple[str, float]] = {}
 
+# "gửi nhóm" trong chat riêng: đăng câu trả lời của bot vào nhóm
+SEND_GROUP_RE = re.compile(r"g[ửu]i\s*nh[óo]m", re.IGNORECASE)
+DEFAULT_GROUP_ID = os.getenv("DEFAULT_GROUP_ID", "")
+user_groups: dict[str, str] = {}  # user_id -> nhóm gần nhất người đó tag bot
+last_private: dict[str, tuple[str, str]] = {}  # user_id -> (câu hỏi, câu trả lời) gần nhất trong chat riêng
+
+
+def post_to_group(user_id: str, sender: str, question: str, answer: str) -> str:
+    group_id = user_groups.get(user_id) or DEFAULT_GROUP_ID
+    if not group_id:
+        return f"Mình chưa biết gửi vào nhóm nào. Bạn vào nhóm tag @{BOT_NAME} 1 lần rồi thử lại nhé."
+    send_text(group_id, f"📷 **{sender}** hỏi: {question}\n\n{answer}")
+    print(f"[gửi nhóm] {user_id} -> {group_id}", flush=True)
+    return "Đã gửi câu trả lời vào nhóm ✅"
+
 
 def handle_update(update: dict):
     print(f"[nhận] {update}", flush=True)
@@ -156,10 +171,15 @@ def handle_update(update: dict):
     chat = msg.get("chat") or {}
     chat_id = chat.get("id")
     sender = (msg.get("from") or {}).get("display_name", "Ai đó")
+    user_id = (msg.get("from") or {}).get("id", "")
     if not chat_id or (msg.get("from") or {}).get("is_bot"):
         return
+    is_group = chat.get("chat_type") == "GROUP"
+    if is_group and user_id:
+        user_groups[user_id] = chat_id
 
     image_url = None
+    to_group = False
     if event == "message.image.received":
         image_url = msg.get("photo_url")
         raw = (msg.get("caption") or "").strip()
@@ -189,6 +209,18 @@ def handle_update(update: dict):
         send_text(chat_id, "Đã xoá trí nhớ cuộc trò chuyện.")
         return
 
+    if not is_group and SEND_GROUP_RE.search(text):
+        rest = SEND_GROUP_RE.sub("", text).strip(" .,:-")
+        if not rest and not image_url:
+            # Chỉ nhắn "gửi nhóm": đăng câu trả lời gần nhất trong chat riêng
+            if user_id not in last_private:
+                send_text(chat_id, "Chưa có câu trả lời nào để gửi. Gửi ảnh/câu hỏi cho mình trước nhé.")
+            else:
+                send_text(chat_id, post_to_group(user_id, sender, *last_private.pop(user_id)))
+            return
+        text = rest or IMAGE_PROMPT
+        to_group = True
+
     with chat_locks[chat_id]:  # mỗi nhóm trả lời lần lượt, các nhóm khác chạy song song
         typing(chat_id)
         try:
@@ -205,7 +237,14 @@ def handle_update(update: dict):
         except Exception as e:
             print(f"[Lỗi] {e!r}")
             answer = "Có lỗi xảy ra, thử lại sau nhé."
-        send_text(chat_id, answer)
+        if to_group:
+            send_text(chat_id, post_to_group(user_id, sender, text, answer))
+        else:
+            send_text(chat_id, answer)
+            if not is_group:
+                last_private[user_id] = (text, answer)
+                if image_url:
+                    send_text(chat_id, "(Nhắn \"gửi nhóm\" để đăng câu trả lời này vào nhóm)")
         print(f"[đã trả lời] {chat_id}: {answer[:80]!r}", flush=True)
 
 
